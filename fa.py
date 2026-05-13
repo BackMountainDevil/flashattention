@@ -40,10 +40,11 @@ def flash_attention_std_torch(q, k, v):
     return out.numpy()
 
 
-def flash_attention_v2_cpu(q, k, v, block_size=64):
+def flash_attention_v2_cpu(q, k, v, block_size_q=64, block_size_kv=128):
     """
     CPU 模拟 FlashAttention-2 分块自注意力
     严格遵循分块 Q、分块 KV、累加输出、Online Softmax 思想
+    支持不同的 Q 和 KV 块大小
     """
     B, N, S, D = q.shape
     scale = 1.0 / np.sqrt(D)
@@ -58,12 +59,12 @@ def flash_attention_v2_cpu(q, k, v, block_size=64):
             V = v[b, h]  # [S, D]
 
             # Q 分块数
-            num_q_blocks = (S + block_size - 1) // block_size
+            num_q_blocks = (S + block_size_q - 1) // block_size_q
 
             for i in range(num_q_blocks):
                 # Q 块起始/结束
-                q_start = i * block_size
-                q_end = min(q_start + block_size, S)
+                q_start = i * block_size_q
+                q_end = min(q_start + block_size_q, S)
                 q_tile = Q[q_start:q_end, :]  # [Br, D]
 
                 # 存储当前 Q 块的输出累加、softmax 分母、最大值（防溢出）
@@ -72,10 +73,10 @@ def flash_attention_v2_cpu(q, k, v, block_size=64):
                 m_i = np.ones((q_end - q_start, 1)) * -np.inf
 
                 # 遍历所有 KV 块
-                num_kv_blocks = (S + block_size - 1) // block_size
+                num_kv_blocks = (S + block_size_kv - 1) // block_size_kv
                 for j in range(num_kv_blocks):
-                    kv_start = j * block_size
-                    kv_end = min(kv_start + block_size, S)
+                    kv_start = j * block_size_kv
+                    kv_end = min(kv_start + block_size_kv, S)
                     k_tile = K[kv_start:kv_end, :]  # [Bc, D]
                     v_tile = V[kv_start:kv_end, :]  # [Bc, D]
 
