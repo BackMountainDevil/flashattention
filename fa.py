@@ -40,11 +40,14 @@ def flash_attention_std_torch(q, k, v):
     return out.numpy()
 
 
-def flash_attention_v2_cpu(q, k, v, block_size_q=64, block_size_kv=128):
+def flash_attention_v2_cpu(
+    q, k, v, block_size_q=128, block_size_kv=128, attn_mask=None
+):
     """
     CPU 模拟 FlashAttention-2 分块自注意力
     严格遵循分块 Q、分块 KV、累加输出、Online Softmax 思想
     支持不同的 Q 和 KV 块大小
+    支持块级 Mask: attn_mask shape: [B, N, num_q_blocks, num_kv_blocks]
     """
     B, N, S, D = q.shape
     scale = 1.0 / np.sqrt(D)
@@ -75,6 +78,10 @@ def flash_attention_v2_cpu(q, k, v, block_size_q=64, block_size_kv=128):
                 # 遍历所有 KV 块
                 num_kv_blocks = (S + block_size_kv - 1) // block_size_kv
                 for j in range(num_kv_blocks):
+                    if attn_mask is not None and not attn_mask[b, h, i, j]:
+                        # 如果 mask 为 False，表示该块不参与计算，直接跳过
+                        continue
+
                     kv_start = j * block_size_kv
                     kv_end = min(kv_start + block_size_kv, S)
                     k_tile = K[kv_start:kv_end, :]  # [Bc, D]
@@ -102,7 +109,9 @@ def flash_attention_v2_cpu(q, k, v, block_size_q=64, block_size_kv=128):
                     m_i = m_i_new
 
                 # 最终归一化
-                O_i = O_i / l_i
+                # 注意：如果某个 Q 块被完全 mask 掉，l_i 可能为 0，这里做个保护防止除零
+                if np.any(l_i != 0):  # 避免除 0
+                    O_i = O_i / l_i
 
                 # 写回输出
                 out[b, h, q_start:q_end] = O_i
@@ -141,7 +150,6 @@ if __name__ == "__main__":
     q = np.random.randn(B, N, S, D).astype(np.float32)
     k = np.random.randn(B, N, S, D).astype(np.float32)
     v = np.random.randn(B, N, S, D).astype(np.float32)
-
     # 标准自注意力
     print("正在计算标准自注意力...")
     out_std_np = flash_attention_std_np(q, k, v)
@@ -153,6 +161,46 @@ if __name__ == "__main__":
     print("正在计算分块 FlashAttention-v2 (CPU模拟)...")
     out_sim = flash_attention_v2_cpu(q, k, v)
 
+    print("\n===== 误差对比 =====")
+    error_stats = compare_error(out_std_torch, out_sim)
+    print(f"最大绝对误差: {error_stats['max_abs_diff']:.6e}")
+    print(f"最大相对误差: {error_stats['max_rel_diff']:.6e}")
+    print(f"平均绝对误差: {error_stats['mean_abs_diff']:.6e}")
+    print(f"平均相对误差: {error_stats['mean_rel_diff']:.6e}")
+    print(f"是否在误差范围内 {error_stats['is_close']}")
+    # 生成【随机分块 mask】
+    block_size_q = 128
+    block_size_kv = 128
+    num_q_blocks = (S + block_size_q - 1) // block_size_q
+    num_kv_blocks = (S + block_size_kv - 1) // block_size_kv
+    attn_mask_np = np.random.rand(B, N, num_q_blocks, num_kv_blocks) > 0.3
+    print("mask shape:", attn_mask_np.shape)
+    out_sim = flash_attention_v2_cpu(q, k, v, block_size_q, block_size_kv, attn_mask_np)
+
+    # 把【分块 mask】转为 torch 需要的【稠密矩阵 mask】
+    # 稠密 mask shape: [B, N, Sq, Skv]
+    dense_mask = np.zeros((B, N, S, S), dtype=bool)
+    for b in range(B):
+        for h in range(N):
+            for i in range(num_q_blocks):
+                q_s = i * block_size_q
+                q_e = min(q_s + block_size_q, S)
+                for j in range(num_kv_blocks):
+                    kv_s = j * block_size_kv
+                    kv_e = min(kv_s + block_size_kv, S)
+                    dense_mask[b, h, q_s:q_e, kv_s:kv_e] = attn_mask_np[b, h, i, j]
+    q_torch = torch.from_numpy(q)
+    k_torch = torch.from_numpy(k)
+    v_torch = torch.from_numpy(v)
+    # 4. 官方 torch 计算（带mask）
+    with torch.no_grad():
+        out_std_torch = F.scaled_dot_product_attention(
+            q_torch,
+            k_torch,
+            v_torch,
+            attn_mask=torch.from_numpy(dense_mask),
+            is_causal=False,
+        ).numpy()
     print("\n===== 误差对比 =====")
     error_stats = compare_error(out_std_torch, out_sim)
     print(f"最大绝对误差: {error_stats['max_abs_diff']:.6e}")
