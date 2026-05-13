@@ -27,7 +27,7 @@ def flash_attention_std_np(q, k, v):
     return out
 
 
-def flash_attention_std_torch(q, k, v):
+def flash_attention_std_torch(q, k, v, attn_mask_np=None):
     """
     PyTorch 官方标准 scaled_dot_product_attention
     输入输出都是 numpy 数组，内部转 tensor 计算
@@ -35,8 +35,27 @@ def flash_attention_std_torch(q, k, v):
     q_tensor = torch.from_numpy(q)
     k_tensor = torch.from_numpy(k)
     v_tensor = torch.from_numpy(v)
-
-    out = F.scaled_dot_product_attention(q_tensor, k_tensor, v_tensor)
+    if not attn_mask_np is None:
+        # 把【分块 mask】转为 torch 需要的【稠密矩阵 mask】
+        # 稠密 mask shape: [B, N, Sq, Skv]
+        B, N, S, _ = q.shape
+        dense_mask = np.zeros((B, N, S, S), dtype=bool)
+        for b in range(B):
+            for h in range(N):
+                for i in range(num_q_blocks):
+                    q_s = i * block_size_q
+                    q_e = min(q_s + block_size_q, S)
+                    for j in range(num_kv_blocks):
+                        kv_s = j * block_size_kv
+                        kv_e = min(kv_s + block_size_kv, S)
+                        dense_mask[b, h, q_s:q_e, kv_s:kv_e] = attn_mask_np[b, h, i, j]
+        with torch.no_grad():
+            out = F.scaled_dot_product_attention(
+                q_tensor, k_tensor, v_tensor, attn_mask=torch.from_numpy(dense_mask)
+            )
+    else:
+        with torch.no_grad():
+            out = F.scaled_dot_product_attention(q_tensor, k_tensor, v_tensor)
     return out.numpy()
 
 
@@ -176,31 +195,7 @@ if __name__ == "__main__":
     attn_mask_np = np.random.rand(B, N, num_q_blocks, num_kv_blocks) > 0.3
     print("mask shape:", attn_mask_np.shape)
     out_sim = flash_attention_v2_cpu(q, k, v, block_size_q, block_size_kv, attn_mask_np)
-
-    # 把【分块 mask】转为 torch 需要的【稠密矩阵 mask】
-    # 稠密 mask shape: [B, N, Sq, Skv]
-    dense_mask = np.zeros((B, N, S, S), dtype=bool)
-    for b in range(B):
-        for h in range(N):
-            for i in range(num_q_blocks):
-                q_s = i * block_size_q
-                q_e = min(q_s + block_size_q, S)
-                for j in range(num_kv_blocks):
-                    kv_s = j * block_size_kv
-                    kv_e = min(kv_s + block_size_kv, S)
-                    dense_mask[b, h, q_s:q_e, kv_s:kv_e] = attn_mask_np[b, h, i, j]
-    q_torch = torch.from_numpy(q)
-    k_torch = torch.from_numpy(k)
-    v_torch = torch.from_numpy(v)
-    # 4. 官方 torch 计算（带mask）
-    with torch.no_grad():
-        out_std_torch = F.scaled_dot_product_attention(
-            q_torch,
-            k_torch,
-            v_torch,
-            attn_mask=torch.from_numpy(dense_mask),
-            is_causal=False,
-        ).numpy()
+    out_std_torch = flash_attention_std_torch(q, k, v, attn_mask_np)
     print("\n===== 误差对比 =====")
     error_stats = compare_error(out_std_torch, out_sim)
     print(f"最大绝对误差: {error_stats['max_abs_diff']:.6e}")
