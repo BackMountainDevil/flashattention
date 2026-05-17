@@ -1,10 +1,13 @@
 自注意力
 
+- softmax.py    safe/online
+- fa.py         np/torch/block sparse
+
 # 参考
 
 [Basic idea behind flash attention (V1) - en](https://damek.github.io/random/basic-idea-behind-flash-attention/)
 
-https://courses.cs.washington.edu/courses/cse599m/23sp/notes/flashattn.pdf
+[From Online Softmax to FlashAttention. Zihao Ye. 2023]()https://courses.cs.washington.edu/courses/cse599m/23sp/notes/flashattn.pdf
 
 [【手撕LLM-Flash Attention】从softmax说起，保姆级超长文！！小冬瓜AIGC](https://zhuanlan.zhihu.com/p/663932651)
 
