@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -57,6 +59,47 @@ def flash_attention_std_torch(q, k, v, attn_mask_np=None):
         with torch.no_grad():
             out = F.scaled_dot_product_attention(q_tensor, k_tensor, v_tensor)
     return out.numpy()
+
+
+def block_sparse_attention_cpu(query, key, value, block_sparse_mask, blocksize=128):
+    """
+    CPU reference: block_sparse_mask (int8 [B,N,q_blocks,kv_blocks]); 1=attend, 0=skip.
+
+    https://gitcode.com/Ascend/MindIE-SD/blob/master/tests/plugin/test_block_sparse_attention.py
+    """
+    bs, nq, seq, dim = query.shape
+    nkv = key.shape[1]
+    gqa = nq // nkv
+    # output = torch.zeros(bs, nq, seq, dim, dtype=torch.float32)
+    output = np.zeros((bs, nq, seq, dim), dtype=np.float32)
+
+    query_f = query  # .float().cpu().numpy()
+    key_f = key  # .float().cpu().numpy()
+    value_f = value  # .float().cpu().numpy()
+    mask_np = block_sparse_mask  # .cpu().numpy()
+
+    for bi in range(bs):
+        for ni in range(nq):
+            num_blocks = math.ceil(seq / blocksize)
+            for s1 in range(num_blocks):
+                mask_block = mask_np[bi, ni, s1, :num_blocks]  # [kv_blocks]
+                mask_seq = np.repeat(mask_block, blocksize)[:seq].astype(bool)
+                start = s1 * blocksize
+                end = min((s1 + 1) * blocksize, seq)
+                q = query_f[bi, ni, start:end]  # [q_len, dim]
+                k_idx = ni // gqa
+                k = key_f[bi, k_idx][mask_seq]
+                v = value_f[bi, k_idx][mask_seq]
+                if k.shape[0] == 0:
+                    out = np.zeros((end - start, dim), dtype=np.float32)
+                else:
+                    p = q @ k.T / np.sqrt(dim)
+                    p = p - p.max(axis=-1, keepdims=True)
+                    exp_p = np.exp(p)
+                    attn = exp_p / (exp_p.sum(axis=-1, keepdims=True) + 1e-12)
+                    out = attn @ v
+                output[bi, ni, start:end] = out  # torch.from_numpy(out)
+    return output
 
 
 def flash_attention_v2_cpu(
@@ -163,24 +206,23 @@ def compare_error(out1, out2, rtol=1e-5, atol=1e-6):
 
 
 if __name__ == "__main__":
-    B, N, S, D = 2, 3, 1024, 64  # batch, heads, seq_len, head_dim
+    B, N, S, D = 2, 3, 1024 * 2, 128  # batch, heads, seq_len, head_dim
 
     np.random.seed(42)  # 固定随机种子，保证可复现
     q = np.random.randn(B, N, S, D).astype(np.float32)
     k = np.random.randn(B, N, S, D).astype(np.float32)
     v = np.random.randn(B, N, S, D).astype(np.float32)
     # 标准自注意力
-    print("正在计算标准自注意力...")
     out_std_np = flash_attention_std_np(q, k, v)
     out_std_torch = flash_attention_std_torch(q, k, v)
     error_stats = compare_error(out_std_np, out_std_torch)
+    print("\n误差对比： flash_attention_std_np flash_attention_std_torch")
     print(f"在误差范围内: {error_stats['is_close']}")
 
     # 分块 FlashAttention 模拟
-    print("正在计算分块 FlashAttention-v2 (CPU模拟)...")
     out_sim = flash_attention_v2_cpu(q, k, v)
+    print("\n误差对比： flash_attention_v2_cpu flash_attention_std_torch")
 
-    print("\n===== 误差对比 =====")
     error_stats = compare_error(out_std_torch, out_sim)
     print(f"最大绝对误差: {error_stats['max_abs_diff']:.6e}")
     print(f"最大相对误差: {error_stats['max_rel_diff']:.6e}")
@@ -196,8 +238,17 @@ if __name__ == "__main__":
     print("mask shape:", attn_mask_np.shape)
     out_sim = flash_attention_v2_cpu(q, k, v, block_size_q, block_size_kv, attn_mask_np)
     out_std_torch = flash_attention_std_torch(q, k, v, attn_mask_np)
-    print("\n===== 误差对比 =====")
+    print("\n误差对比： flash_attention_v2_cpu flash_attention_std_torch 带mask")
     error_stats = compare_error(out_std_torch, out_sim)
+    print(f"最大绝对误差: {error_stats['max_abs_diff']:.6e}")
+    print(f"最大相对误差: {error_stats['max_rel_diff']:.6e}")
+    print(f"平均绝对误差: {error_stats['mean_abs_diff']:.6e}")
+    print(f"平均相对误差: {error_stats['mean_rel_diff']:.6e}")
+    print(f"是否在误差范围内 {error_stats['is_close']}")
+
+    print("\n误差对比： flash_attention_v2_cpu block_sparse_attention_cpu 带mask")
+    out_ref = block_sparse_attention_cpu(q, k, v, attn_mask_np)
+    error_stats = compare_error(out_sim, out_ref)
     print(f"最大绝对误差: {error_stats['max_abs_diff']:.6e}")
     print(f"最大相对误差: {error_stats['max_rel_diff']:.6e}")
     print(f"平均绝对误差: {error_stats['mean_abs_diff']:.6e}")
